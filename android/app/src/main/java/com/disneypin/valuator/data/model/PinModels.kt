@@ -18,15 +18,20 @@ data class Pin(
     val visualTags: String = "",
     val pinpicsId: String = "",
     val sourceFile: String = "",
-    val notes: String = ""
+    val notes: String = "",
+    val dataSource: String = "Seeded",
+    val referenceImagePath: String = "",
+    val valuationSources: String = ""
 )
 
 data class PriceHistoryEntry(
-    val id: Long,
+    val historyId: Long,
     val pinId: String,
     val lowUsd: Double,
     val highUsd: Double,
-    val recordedAt: String
+    val estMarketValueUsd: Double,
+    val recordedAt: String,
+    val source: String
 )
 
 data class CatalogStats(
@@ -34,7 +39,10 @@ data class CatalogStats(
     val grailCount: Int,
     val highValueCount: Int,
     val avgMarketValueUsd: Double,
-    val resorts: List<String>
+    val resorts: List<String>,
+    val seededCount: Int = totalPins,
+    val learnedCount: Int = 0,
+    val embeddingsCount: Int = 0
 )
 
 data class PortfolioItem(
@@ -120,4 +128,160 @@ data class AppraisalResult(
     val hasOriginalCard: Boolean,
     val liquidityScore: Int,
     val scrapperAssessment: ScrapperAssessmentResult
+)
+
+// --- v2.0 Photo-First Hybrid Pipeline Models ---
+
+data class AppSettings(
+    val geminiApiKey: String = "",
+    val geminiModel: String = "gemini-2.5-flash",
+    val stalePriceDays: Int = 60
+)
+
+data class BoundingBoxNorm(
+    val ymin: Int,
+    val xmin: Int,
+    val ymax: Int,
+    val xmax: Int
+) {
+    val centerX: Float get() = (xmin + xmax) / 2000f
+    val bottomY: Float get() = ymax / 1000f
+    val topY: Float get() = ymin / 1000f
+}
+
+data class DetectedPinCandidate(
+    val tempId: Int,
+    val box2d: BoundingBoxNorm,
+    val pinName: String,
+    val character: String = "",
+    val collectionGuess: String = "",
+    val subSetGuess: String = "",
+    val resortGuess: String = "",
+    val rarityHint: String = "Common",
+    val visualTags: String = "",
+    val hasHiddenMickey: Boolean = false,
+    val confidence: Double = 0.8,
+    val scrapperRiskHint: String = "Low",
+    val scrapperNotes: String = ""
+)
+
+data class PinValuationSource(
+    val title: String,
+    val url: String
+)
+
+enum class MatchSource(val label: String) {
+    LOCAL_VISUAL("Local Visual"),
+    LOCAL_DB("Local DB"),
+    GEMINI_SEARCH("Gemini Web"),
+    PENDING_SEARCH("Searching...")
+}
+
+data class ScannedPinResult(
+    val detectionId: String,
+    val photoIndex: Int,
+    val box2d: BoundingBoxNorm,
+    val cropImagePath: String = "",
+    val candidate: DetectedPinCandidate,
+    val matchedPin: Pin? = null,
+    val matchSource: MatchSource = MatchSource.PENDING_SEARCH,
+    val matchConfidence: Double = 0.0,
+    val displayTitle: String = candidate.pinName,
+    val displayCollection: String = candidate.collectionGuess,
+    val marketLowUsd: Double = 0.0,
+    val marketHighUsd: Double = 0.0,
+    val estMarketValueUsd: Double = 0.0,
+    val priceTier: String = "Standard (<$20)",
+    val scrapperRisk: String = candidate.scrapperRiskHint,
+    val priceConfidence: String = "Low Conf",
+    val citations: List<PinValuationSource> = emptyList(),
+    val isRefreshing: Boolean = false,
+    val errorNote: String? = null
+)
+
+data class PhotoScanResult(
+    val photoIndex: Int,
+    val imagePath: String,
+    val scanId: Long? = null,
+    val pins: List<ScannedPinResult> = emptyList(),
+    val errorMessage: String? = null
+)
+
+data class ScanBatchState(
+    val isScanning: Boolean = false,
+    val statusMessage: String = "",
+    val photos: List<PhotoScanResult> = emptyList(),
+    val selectedPhotoIndex: Int = 0,
+    val selectedDetectionId: String? = null,
+    val errorMessage: String? = null
+) {
+    val allPinsRanked: List<ScannedPinResult>
+        get() = photos.flatMap { it.pins }
+            .sortedWith(
+                compareByDescending<ScannedPinResult> { it.estMarketValueUsd }
+                    .thenBy { it.matchSource == MatchSource.PENDING_SEARCH }
+            )
+}
+
+data class BoardScanSummary(
+    val scanId: Long,
+    val imageFilename: String,
+    val imagePath: String,
+    val location: String,
+    val scannedAt: String,
+    val pinCount: Int,
+    val totalLowUsd: Double,
+    val totalHighUsd: Double,
+    val totalMidUsd: Double,
+    val status: String
+)
+
+data class PendingScanItem(
+    val id: Long,
+    val imagePath: String,
+    val queuedAt: String,
+    val status: String
+)
+
+data class PinEmbeddingRecord(
+    val embeddingId: Long,
+    val pinId: String,
+    val imagePath: String,
+    val modelName: String,
+    val embeddingBlob: ByteArray
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PinEmbeddingRecord) return false
+        return embeddingId == other.embeddingId &&
+            pinId == other.pinId &&
+            modelName == other.modelName &&
+            embeddingBlob.contentEquals(other.embeddingBlob)
+    }
+
+    override fun hashCode(): Int {
+        var result = embeddingId.hashCode()
+        result = 31 * result + pinId.hashCode()
+        result = 31 * result + modelName.hashCode()
+        result = 31 * result + embeddingBlob.contentHashCode()
+        return result
+    }
+}
+
+data class LearnedPinInput(
+    val pinName: String,
+    val collection: String,
+    val subSet: String = "",
+    val resort: String = "",
+    val yearWave: String = "",
+    val rarity: String = "Common",
+    val marketLowUsd: Double,
+    val marketHighUsd: Double,
+    val priceConfidence: String = "Peer Est.",
+    val scrapperRisk: String = "Low",
+    val visualTags: String = "",
+    val notes: String = "",
+    val dataSource: String = "Gemini Search",
+    val referenceImagePath: String = "",
+    val valuationSourcesJson: String = ""
 )

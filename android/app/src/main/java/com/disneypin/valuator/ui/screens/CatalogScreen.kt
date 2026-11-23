@@ -49,11 +49,14 @@ fun CatalogScreen(
     searchQuery: String,
     selectedPriceTier: String,
     selectedRarity: String,
+    selectedSourceFilter: String,
     onSearchQueryChange: (String) -> Unit,
     onPriceTierChange: (String) -> Unit,
     onRarityChange: (String) -> Unit,
+    onSourceFilterChange: (String) -> Unit,
     onPinClick: (Pin) -> Unit
 ) {
+    val sources = listOf("All", "Seeded", "Gemini Learned")
     val tiers = listOf("All", "Grail ($50+)", "High ($30-$49)", "Good ($20-$29)", "Standard (<$20)")
     val rarities = listOf("All", "Common", "Chaser / Completer", "Super Chaser")
 
@@ -75,8 +78,8 @@ fun CatalogScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    StatColumn(label = "Catalog Pins", value = "${s.totalPins}")
-                    StatColumn(label = "Grails ($50+)", value = "${s.grailCount}")
+                    StatColumn(label = "Total Pins", value = "${s.totalPins}")
+                    StatColumn(label = "Learned", value = "${s.learnedCount}")
                     StatColumn(label = "Avg FMV", value = formatUsd(s.avgMarketValueUsd))
                 }
             }
@@ -101,7 +104,23 @@ fun CatalogScreen(
             shape = RoundedCornerShape(12.dp)
         )
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            sources.forEach { src ->
+                FilterChip(
+                    selected = selectedSourceFilter == src,
+                    onClick = { onSourceFilterChange(src) },
+                    label = { Text(src) }
+                )
+            }
+        }
 
         Row(
             modifier = Modifier

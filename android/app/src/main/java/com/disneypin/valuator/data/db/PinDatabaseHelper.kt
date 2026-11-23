@@ -10,6 +10,7 @@ class PinDatabaseHelper(private val context: Context) {
     companion object {
         private const val DB_NAME = "disney_pin_database.sqlite"
         private const val ASSET_NAME = "disney_pin_database.sqlite"
+        private const val CURRENT_SCHEMA_VERSION = 2
     }
 
     private var database: SQLiteDatabase? = null
@@ -38,7 +39,9 @@ class PinDatabaseHelper(private val context: Context) {
             null,
             SQLiteDatabase.OPEN_READWRITE
         )
+        db.execSQL("PRAGMA foreign_keys = ON;")
         ensureAppTables(db)
+        migrateIfNeeded(db)
         database = db
         return db
     }
@@ -69,6 +72,56 @@ class PinDatabaseHelper(private val context: Context) {
             )
             """.trimIndent()
         )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS pending_scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_path TEXT NOT NULL,
+                queued_at TEXT NOT NULL DEFAULT (DATETIME('now')),
+                status TEXT NOT NULL DEFAULT 'PENDING'
+            )
+            """.trimIndent()
+        )
+    }
+
+    private fun migrateIfNeeded(db: SQLiteDatabase) {
+        val currentVersion = db.rawQuery("PRAGMA user_version", null).use { c ->
+            if (c.moveToFirst()) c.getInt(0) else 0
+        }
+        if (currentVersion < CURRENT_SCHEMA_VERSION) {
+            addColumnIfMissing(db, "pins", "data_source", "TEXT NOT NULL DEFAULT 'Seeded'")
+            addColumnIfMissing(db, "pins", "reference_image_path", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfMissing(db, "pins", "valuation_sources", "TEXT NOT NULL DEFAULT ''")
+
+            addColumnIfMissing(db, "board_scans", "image_path", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfMissing(db, "board_scans", "status", "TEXT NOT NULL DEFAULT 'COMPLETED'")
+
+            addColumnIfMissing(db, "scan_detections", "box_json", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfMissing(db, "scan_detections", "match_source", "TEXT NOT NULL DEFAULT 'LOCAL_DB'")
+            addColumnIfMissing(db, "scan_detections", "detected_label", "TEXT NOT NULL DEFAULT ''")
+            addColumnIfMissing(db, "scan_detections", "market_low_usd", "REAL NOT NULL DEFAULT 0.0")
+            addColumnIfMissing(db, "scan_detections", "market_high_usd", "REAL NOT NULL DEFAULT 0.0")
+
+            db.execSQL("PRAGMA user_version = $CURRENT_SCHEMA_VERSION")
+        }
+    }
+
+    private fun addColumnIfMissing(
+        db: SQLiteDatabase,
+        table: String,
+        column: String,
+        definition: String
+    ) {
+        val existingColumns = mutableSetOf<String>()
+        db.rawQuery("PRAGMA table_info($table)", null).use { c ->
+            val nameIdx = c.getColumnIndex("name")
+            while (c.moveToNext()) {
+                if (nameIdx >= 0) existingColumns.add(c.getString(nameIdx))
+            }
+        }
+        if (column !in existingColumns) {
+            db.execSQL("ALTER TABLE $table ADD COLUMN $column $definition")
+        }
     }
 
     @Synchronized
