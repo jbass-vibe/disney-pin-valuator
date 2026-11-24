@@ -135,7 +135,8 @@ data class AppraisalResult(
 data class AppSettings(
     val geminiApiKey: String = "",
     val geminiModel: String = "gemini-2.5-flash",
-    val stalePriceDays: Int = 60
+    val stalePriceDays: Int = 60,
+    val autoVerifyOnline: Boolean = true
 )
 
 data class BoundingBoxNorm(
@@ -158,6 +159,9 @@ data class DetectedPinCandidate(
     val subSetGuess: String = "",
     val resortGuess: String = "",
     val rarityHint: String = "Common",
+    val estLowUsd: Double = 10.0,
+    val estHighUsd: Double = 16.0,
+    val needsWebVerification: Boolean = false,
     val visualTags: String = "",
     val hasHiddenMickey: Boolean = false,
     val confidence: Double = 0.8,
@@ -173,6 +177,7 @@ data class PinValuationSource(
 enum class MatchSource(val label: String) {
     LOCAL_VISUAL("Local Visual"),
     LOCAL_DB("Local DB"),
+    GEMINI_ESTIMATE("Gemini Est."),
     GEMINI_SEARCH("Gemini Web"),
     PENDING_SEARCH("Searching...")
 }

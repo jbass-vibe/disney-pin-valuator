@@ -269,8 +269,8 @@ class PinValuatorViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun saveSettings(apiKey: String, model: String, staleDays: Int) {
-        settingsRepository.saveSettings(apiKey, model, staleDays)
+    fun saveSettings(apiKey: String, model: String, staleDays: Int, autoVerifyOnline: Boolean) {
+        settingsRepository.saveSettings(apiKey, model, staleDays, autoVerifyOnline)
         _settingsState.value = settingsRepository.loadSettings()
         _snackbarMessage.value = "Settings saved"
     }

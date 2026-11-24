@@ -9,6 +9,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -18,6 +19,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -32,12 +34,13 @@ fun SettingsDialog(
     settings: AppSettings,
     stats: CatalogStats?,
     onDismiss: () -> Unit,
-    onSave: (apiKey: String, model: String, staleDays: Int) -> Unit,
+    onSave: (apiKey: String, model: String, staleDays: Int, autoVerifyOnline: Boolean) -> Unit,
     onTestConnection: suspend (apiKey: String, model: String) -> Result<String>
 ) {
     var apiKey by remember(settings) { mutableStateOf(settings.geminiApiKey) }
     var model by remember(settings) { mutableStateOf(settings.geminiModel) }
     var staleDays by remember(settings) { mutableIntStateOf(settings.stalePriceDays) }
+    var autoVerifyOnline by remember(settings) { mutableStateOf(settings.autoVerifyOnline) }
     var testResult by remember { mutableStateOf<String?>(null) }
     var isTesting by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -62,6 +65,21 @@ fun SettingsDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Auto-verify top high-value pins online (max 1 search call/board)",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = autoVerifyOnline,
+                        onCheckedChange = { autoVerifyOnline = it }
+                    )
+                }
                 Text(
                     text = "Price Freshness Window: $staleDays days",
                     style = MaterialTheme.typography.bodySmall,
@@ -110,7 +128,7 @@ fun SettingsDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                onSave(apiKey, model, staleDays)
+                onSave(apiKey, model, staleDays, autoVerifyOnline)
                 onDismiss()
             }) {
                 Text("Save")

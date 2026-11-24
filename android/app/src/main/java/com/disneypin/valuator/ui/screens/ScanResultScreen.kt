@@ -244,7 +244,11 @@ fun ScanResultScreen(
                                     Spacer(modifier = Modifier.height(6.dp))
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                         PriceTierBadge(det.priceTier)
-                                        val srcColor = if (det.matchSource == MatchSource.GEMINI_SEARCH) CastleBlue else RiskLowGreen
+                                        val srcColor = when (det.matchSource) {
+                                            MatchSource.GEMINI_SEARCH -> CastleBlue
+                                            MatchSource.GEMINI_ESTIMATE -> Color(0xFF9C6500)
+                                            else -> RiskLowGreen
+                                        }
                                         BadgeChip(
                                             text = det.matchSource.label,
                                             backgroundColor = srcColor.copy(alpha = 0.14f),

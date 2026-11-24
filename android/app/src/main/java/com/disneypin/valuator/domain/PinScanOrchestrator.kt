@@ -8,7 +8,6 @@ import android.net.Uri
 import com.disneypin.valuator.data.db.PinRepository
 import com.disneypin.valuator.data.db.PinSanitizer
 import com.disneypin.valuator.data.model.AppSettings
-import com.disneypin.valuator.data.model.BoundingBoxNorm
 import com.disneypin.valuator.data.model.DetectedPinCandidate
 import com.disneypin.valuator.data.model.LearnedPinInput
 import com.disneypin.valuator.data.model.MatchSource
@@ -17,16 +16,12 @@ import com.disneypin.valuator.data.model.Pin
 import com.disneypin.valuator.data.model.ScanBatchState
 import com.disneypin.valuator.data.model.ScannedPinResult
 import com.disneypin.valuator.data.remote.GeminiApiClient
+import com.disneypin.valuator.data.remote.GeminiRateLimitException
 import com.disneypin.valuator.data.remote.Pass2CropRequest
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import java.io.File
 
 class PinScanOrchestrator(
@@ -105,100 +100,123 @@ class PinScanOrchestrator(
         photos: List<Pair<File, Bitmap>>,
         settings: AppSettings
     ): Flow<ScanBatchState> = flow {
-        emit(
-            ScanBatchState(
-                isScanning = true,
-                statusMessage = "Detecting pins in ${photos.size} photo(s)..."
-            )
-        )
-
         val storedEmbeddings = repository.getAllPinEmbeddings(VisualFingerprint.MODEL_NAME)
-        val semaphore = Semaphore(2)
+        val initialResults = mutableListOf<PhotoScanResult>()
 
-        // Pass 1 + Local Matching
-        val initialResults: List<PhotoScanResult> = coroutineScope {
-            photos.mapIndexed { photoIdx, (file, bitmap) ->
-                async {
-                    semaphore.withPermit {
-                        runCatching {
-                            val b64 = ImageUtils.bitmapToJpegBase64(bitmap)
-                            val detected = geminiClient.detectPinsInPhoto(b64, settings.geminiApiKey, settings.geminiModel)
-                            val tempDir = File(context.filesDir, "pin_crops_tmp").apply { mkdirs() }
-                            val mappedPins = detected.map { cand ->
-                                val cropFile = File(tempDir, "tmp_${System.currentTimeMillis()}_${photoIdx}_${cand.tempId}.jpg")
-                                val cropBmp = ImageUtils.cropAndSavePinThumbnail(bitmap, cand.box2d, cropFile)
-                                val cropEmbedding = VisualFingerprint.compute(cropBmp)
-                                resolveLocally(
-                                    photoIndex = photoIdx,
-                                    candidate = cand,
-                                    cropFilePath = cropFile.absolutePath,
-                                    cropEmbedding = cropEmbedding,
-                                    storedEmbeddings = storedEmbeddings,
-                                    staleThresholdDays = settings.stalePriceDays
-                                )
-                            }
-                            PhotoScanResult(photoIndex = photoIdx, imagePath = file.absolutePath, pins = mappedPins)
-                        }.getOrElse { err ->
-                            PhotoScanResult(
-                                photoIndex = photoIdx,
-                                imagePath = file.absolutePath,
-                                errorMessage = err.message ?: "Detection failed"
-                            )
-                        }
-                    }
+        // Sequential Pass 1 + Local Matching (concurrency = 1)
+        for ((photoIdx, pair) in photos.withIndex()) {
+            val (file, bitmap) = pair
+            emit(
+                ScanBatchState(
+                    isScanning = true,
+                    statusMessage = "Scanning photo ${photoIdx + 1}/${photos.size}...",
+                    photos = initialResults.toList()
+                )
+            )
+            val result = runCatching {
+                val b64 = ImageUtils.bitmapToJpegBase64(bitmap)
+                val detected = geminiClient.detectPinsInPhoto(b64, settings.geminiApiKey, settings.geminiModel)
+                val tempDir = File(context.filesDir, "pin_crops_tmp").apply { mkdirs() }
+                val mappedPins = detected.map { cand ->
+                    val cropFile = File(tempDir, "tmp_${System.currentTimeMillis()}_${photoIdx}_${cand.tempId}.jpg")
+                    val cropBmp = ImageUtils.cropAndSavePinThumbnail(bitmap, cand.box2d, cropFile)
+                    val cropEmbedding = VisualFingerprint.compute(cropBmp)
+                    resolveLocally(
+                        photoIndex = photoIdx,
+                        candidate = cand,
+                        cropFilePath = cropFile.absolutePath,
+                        cropEmbedding = cropEmbedding,
+                        storedEmbeddings = storedEmbeddings,
+                        settings = settings
+                    )
                 }
-            }.awaitAll()
+                PhotoScanResult(photoIndex = photoIdx, imagePath = file.absolutePath, pins = mappedPins)
+            }.getOrElse { err ->
+                android.util.Log.e("PinScanOrchestrator", "Pass 1 photo ${photoIdx + 1} failed", err)
+                PhotoScanResult(
+                    photoIndex = photoIdx,
+                    imagePath = file.absolutePath,
+                    errorMessage = err.message ?: "Detection failed"
+                )
+            }
+            initialResults.add(result)
         }
 
-        val unresolvedCount = initialResults.sumOf { p -> p.pins.count { it.matchSource == MatchSource.PENDING_SEARCH } }
-        emit(
-            ScanBatchState(
-                isScanning = unresolvedCount > 0,
-                statusMessage = if (unresolvedCount > 0) "Searching market prices for $unresolvedCount pin(s)..." else "Scan complete",
-                photos = initialResults
-            )
-        )
-
-        // Pass 2 for unresolved / stale pins in chunks of <= 5
+        // Select top <= 4 pins for single Pass 2 Search Grounding call; downgrade any others to GEMINI_ESTIMATE
         val workingPhotos = initialResults.toMutableList()
-        val pendingItems = workingPhotos.flatMap { photo ->
+        val allPending = workingPhotos.flatMap { photo ->
             photo.pins.filter { it.matchSource == MatchSource.PENDING_SEARCH }
         }
+        val selectedForPass2 = if (settings.autoVerifyOnline) {
+            selectTopForVerification(allPending, MAX_AUTO_VERIFY_PINS)
+        } else {
+            emptyList()
+        }
+        val selectedIds = selectedForPass2.map { it.detectionId }.toSet()
+
+        // Downgrade non-selected PENDING_SEARCH pins immediately so they keep their Pass 1 estimate
+        for (pIdx in workingPhotos.indices) {
+            val photo = workingPhotos[pIdx]
+            workingPhotos[pIdx] = photo.copy(
+                pins = photo.pins.map { det ->
+                    if (det.matchSource == MatchSource.PENDING_SEARCH && det.detectionId !in selectedIds) {
+                        det.copy(matchSource = downgradedSourceFor(det))
+                    } else det
+                }
+            )
+        }
+
+        emit(
+            ScanBatchState(
+                isScanning = selectedForPass2.isNotEmpty(),
+                statusMessage = if (selectedForPass2.isNotEmpty()) {
+                    "Verifying top ${selectedForPass2.size} high-value pin(s) online..."
+                } else {
+                    "Scan complete"
+                },
+                photos = workingPhotos.toList()
+            )
+        )
+
         var pass2ErrorMessage: String? = null
-
-        if (pendingItems.isNotEmpty()) {
-            val chunks = pendingItems.chunked(5)
-            chunks.forEachIndexed { chunkIdx, chunk ->
-                emit(
-                    ScanBatchState(
-                        isScanning = true,
-                        statusMessage = "Researching market prices (batch ${chunkIdx + 1}/${chunks.size})...",
-                        photos = workingPhotos.toList(),
-                        errorMessage = pass2ErrorMessage
-                    )
+        if (selectedForPass2.isNotEmpty()) {
+            val requests = selectedForPass2.mapIndexedNotNull { idx, item ->
+                val bmp = ImageUtils.decodeNormalizedFile(item.cropImagePath, maxEdgePx = 192) ?: return@mapIndexedNotNull null
+                Pass2CropRequest(
+                    tempId = idx,
+                    jpegBase64 = ImageUtils.bitmapToJpegBase64(bmp, quality = 75),
+                    pass1Hint = "${item.candidate.pinName} ${item.candidate.collectionGuess} ${item.candidate.subSetGuess}".trim(),
+                    existingCatalogName = item.matchedPin?.pinName
                 )
-                val requests = chunk.mapIndexedNotNull { idx, item ->
-                    val bmp = ImageUtils.decodeNormalizedFile(item.cropImagePath, maxEdgePx = 320) ?: return@mapIndexedNotNull null
-                    Pass2CropRequest(
-                        tempId = idx,
-                        jpegBase64 = ImageUtils.bitmapToJpegBase64(bmp, quality = 85),
-                        pass1Hint = "${item.candidate.pinName} ${item.candidate.collectionGuess} ${item.candidate.subSetGuess}".trim(),
-                        existingCatalogName = item.matchedPin?.pinName
+            }
+
+            val valuationsResult = runCatching {
+                geminiClient.researchPinValuations(requests, settings.geminiApiKey, settings.geminiModel)
+            }
+
+            if (valuationsResult.isFailure) {
+                val err = valuationsResult.exceptionOrNull()
+                android.util.Log.e("PinScanOrchestrator", "Pass 2 verification failed", err)
+                pass2ErrorMessage = if (err is GeminiRateLimitException) {
+                    "Rate limit reached — showing Pass 1 estimates. Tap Refresh on any pin to verify online."
+                } else {
+                    "${err?.message ?: "Online verification unavailable"} — showing Pass 1 estimates."
+                }
+                // Circuit breaker: downgrade all remaining PENDING_SEARCH pins cleanly
+                for (pIdx in workingPhotos.indices) {
+                    val photo = workingPhotos[pIdx]
+                    workingPhotos[pIdx] = photo.copy(
+                        pins = photo.pins.map { det ->
+                            if (det.matchSource == MatchSource.PENDING_SEARCH) {
+                                det.copy(matchSource = downgradedSourceFor(det))
+                            } else det
+                        }
                     )
                 }
-
-                var chunkError: String? = null
-                val valuations = runCatching {
-                    geminiClient.researchPinValuations(requests, settings.geminiApiKey, settings.geminiModel)
-                }.getOrElse { err ->
-                    android.util.Log.e("PinScanOrchestrator", "Pass 2 batch ${chunkIdx + 1} failed", err)
-                    chunkError = err.message ?: "Online price lookup failed"
-                    pass2ErrorMessage = chunkError
-                    emptyList()
-                }
-
+            } else {
+                val valuations = valuationsResult.getOrDefault(emptyList())
                 val byTempId = valuations.associateBy { it.tempId }
-                chunk.forEachIndexed { idx, item ->
+                selectedForPass2.forEachIndexed { idx, item ->
                     val valResult = byTempId[idx] ?: valuations.getOrNull(idx)
                     val updatedPinResult = if (valResult != null) {
                         val citationsJson = PinSanitizer.encodeCitationsJson(valResult.citations)
@@ -227,13 +245,13 @@ class PinScanOrchestrator(
                                     scrapperRisk = valResult.scrapperRisk,
                                     visualTags = valResult.visualTags.ifBlank { item.candidate.visualTags },
                                     notes = valResult.notes,
+                                    dataSource = "Gemini Search",
                                     referenceImagePath = "",
                                     valuationSourcesJson = citationsJson
                                 )
                             )
                         }
 
-                        // Persist permanent crop + visual fingerprint
                         val permCropFile = persistPermanentCrop(savedPin.pinId, item.cropImagePath)
                         val cropBmp = ImageUtils.decodeNormalizedFile(permCropFile.absolutePath, maxEdgePx = 320)
                         if (cropBmp != null) {
@@ -258,13 +276,9 @@ class PinScanOrchestrator(
                             errorNote = null
                         )
                     } else {
-                        item.copy(
-                            matchSource = if (item.matchedPin != null) MatchSource.LOCAL_DB else MatchSource.PENDING_SEARCH,
-                            errorNote = chunkError ?: "No valuation returned for Pin #${idx + 1}"
-                        )
+                        item.copy(matchSource = downgradedSourceFor(item))
                     }
 
-                    // Replace in workingPhotos
                     val pIdx = updatedPinResult.photoIndex
                     val photo = workingPhotos[pIdx]
                     workingPhotos[pIdx] = photo.copy(
@@ -289,7 +303,7 @@ class PinScanOrchestrator(
         emit(
             ScanBatchState(
                 isScanning = false,
-                statusMessage = if (pass2ErrorMessage == null) "Completed" else "Completed with lookup errors",
+                statusMessage = if (pass2ErrorMessage == null) "Completed" else "Completed (Pass 1 estimates)",
                 photos = persistedPhotos,
                 errorMessage = pass2ErrorMessage ?: persistedPhotos.firstOrNull { it.errorMessage != null }?.errorMessage
             )
@@ -299,10 +313,10 @@ class PinScanOrchestrator(
     suspend fun refreshSinglePin(pin: Pin, settings: AppSettings): Pin? {
         if (!isOnline() || settings.geminiApiKey.isBlank()) return null
         val bmp = if (pin.referenceImagePath.isNotBlank()) {
-            ImageUtils.decodeNormalizedFile(pin.referenceImagePath, maxEdgePx = 320)
+            ImageUtils.decodeNormalizedFile(pin.referenceImagePath, maxEdgePx = 192)
         } else null
 
-        val b64 = if (bmp != null) ImageUtils.bitmapToJpegBase64(bmp, 85) else return null
+        val b64 = if (bmp != null) ImageUtils.bitmapToJpegBase64(bmp, 75) else return null
         val valuations = geminiClient.researchPinValuations(
             crops = listOf(
                 Pass2CropRequest(
@@ -333,7 +347,7 @@ class PinScanOrchestrator(
         cropFilePath: String,
         cropEmbedding: ByteArray,
         storedEmbeddings: List<com.disneypin.valuator.data.model.PinEmbeddingRecord>,
-        staleThresholdDays: Int
+        settings: AppSettings
     ): ScannedPinResult {
         val detId = "p${photoIndex}_t${candidate.tempId}"
 
@@ -342,7 +356,8 @@ class PinScanOrchestrator(
         if (visualHit != null) {
             val pin = repository.getPinById(visualHit.first)
             if (pin != null) {
-                val fresh = LocalPinMatcher.isPriceFresh(pin.priceUpdated, staleThresholdDays = staleThresholdDays)
+                val fresh = LocalPinMatcher.isPriceFresh(pin.priceUpdated, staleThresholdDays = settings.stalePriceDays)
+                val shouldQueueVerify = !fresh && settings.autoVerifyOnline
                 return ScannedPinResult(
                     detectionId = detId,
                     photoIndex = photoIndex,
@@ -350,7 +365,7 @@ class PinScanOrchestrator(
                     cropImagePath = cropFilePath,
                     candidate = candidate,
                     matchedPin = pin,
-                    matchSource = if (fresh) MatchSource.LOCAL_VISUAL else MatchSource.PENDING_SEARCH,
+                    matchSource = if (shouldQueueVerify) MatchSource.PENDING_SEARCH else MatchSource.LOCAL_VISUAL,
                     matchConfidence = visualHit.second,
                     displayTitle = pin.pinName,
                     displayCollection = pin.collection,
@@ -365,7 +380,7 @@ class PinScanOrchestrator(
             }
         }
 
-        // FTS5 + Weighted Metadata Match
+        // FTS + Weighted Metadata Match
         val queries = LocalPinMatcher.buildSearchQueries(candidate)
         val pool = mutableListOf<Pin>()
         for (q in queries) {
@@ -375,39 +390,18 @@ class PinScanOrchestrator(
         val metaHit = LocalPinMatcher.matchByMetadata(candidate, distinctPool)
         if (metaHit != null) {
             val (pin, score) = metaHit
-            val fresh = LocalPinMatcher.isPriceFresh(pin.priceUpdated, staleThresholdDays = staleThresholdDays)
-            if (fresh) {
-                // Also cache visual embedding for future Pass 0 hits
-                val permFile = persistPermanentCrop(pin.pinId, cropFilePath)
-                repository.upsertPinEmbedding(pin.pinId, permFile.absolutePath, VisualFingerprint.MODEL_NAME, cropEmbedding)
-                return ScannedPinResult(
-                    detectionId = detId,
-                    photoIndex = photoIndex,
-                    box2d = candidate.box2d,
-                    cropImagePath = permFile.absolutePath,
-                    candidate = candidate,
-                    matchedPin = pin,
-                    matchSource = MatchSource.LOCAL_DB,
-                    matchConfidence = score,
-                    displayTitle = pin.pinName,
-                    displayCollection = pin.collection,
-                    marketLowUsd = pin.marketLowUsd,
-                    marketHighUsd = pin.marketHighUsd,
-                    estMarketValueUsd = pin.estMarketValueUsd,
-                    priceTier = pin.priceTier,
-                    scrapperRisk = pin.scrapperRisk,
-                    priceConfidence = pin.priceConfidence,
-                    citations = PinSanitizer.parseCitationsJson(pin.valuationSources)
-                )
-            }
+            val fresh = LocalPinMatcher.isPriceFresh(pin.priceUpdated, staleThresholdDays = settings.stalePriceDays)
+            val permFile = persistPermanentCrop(pin.pinId, cropFilePath)
+            repository.upsertPinEmbedding(pin.pinId, permFile.absolutePath, VisualFingerprint.MODEL_NAME, cropEmbedding)
+            val shouldQueueVerify = !fresh && settings.autoVerifyOnline
             return ScannedPinResult(
                 detectionId = detId,
                 photoIndex = photoIndex,
                 box2d = candidate.box2d,
-                cropImagePath = cropFilePath,
+                cropImagePath = permFile.absolutePath,
                 candidate = candidate,
                 matchedPin = pin,
-                matchSource = MatchSource.PENDING_SEARCH,
+                matchSource = if (shouldQueueVerify) MatchSource.PENDING_SEARCH else MatchSource.LOCAL_DB,
                 matchConfidence = score,
                 displayTitle = pin.pinName,
                 displayCollection = pin.collection,
@@ -416,19 +410,62 @@ class PinScanOrchestrator(
                 estMarketValueUsd = pin.estMarketValueUsd,
                 priceTier = pin.priceTier,
                 scrapperRisk = pin.scrapperRisk,
-                priceConfidence = pin.priceConfidence
+                priceConfidence = pin.priceConfidence,
+                citations = PinSanitizer.parseCitationsJson(pin.valuationSources)
             )
         }
+
+        // Unmatched locally -> immediately persist Pass 1 estimate so it's priced & saved offline!
+        val shouldVerify = candidate.needsWebVerification ||
+            candidate.estHighUsd >= 25.0 ||
+            candidate.rarityHint != "Common" ||
+            candidate.confidence < 0.70
+
+        val savedEstimatePin = repository.upsertLearnedPin(
+            LearnedPinInput(
+                pinName = candidate.pinName,
+                collection = candidate.collectionGuess.ifBlank { "Disney Parks" },
+                subSet = candidate.subSetGuess,
+                resort = candidate.resortGuess,
+                rarity = candidate.rarityHint,
+                marketLowUsd = candidate.estLowUsd,
+                marketHighUsd = candidate.estHighUsd,
+                priceConfidence = "Peer Est.",
+                scrapperRisk = candidate.scrapperRiskHint,
+                visualTags = candidate.visualTags,
+                notes = candidate.scrapperNotes,
+                dataSource = "Gemini Estimate"
+            )
+        )
+        val permFile = persistPermanentCrop(savedEstimatePin.pinId, cropFilePath)
+        repository.upsertPinEmbedding(savedEstimatePin.pinId, permFile.absolutePath, VisualFingerprint.MODEL_NAME, cropEmbedding)
 
         return ScannedPinResult(
             detectionId = detId,
             photoIndex = photoIndex,
             box2d = candidate.box2d,
-            cropImagePath = cropFilePath,
+            cropImagePath = permFile.absolutePath,
             candidate = candidate,
-            matchSource = MatchSource.PENDING_SEARCH,
-            matchConfidence = candidate.confidence
+            matchedPin = savedEstimatePin,
+            matchSource = if (shouldVerify && settings.autoVerifyOnline) MatchSource.PENDING_SEARCH else MatchSource.GEMINI_ESTIMATE,
+            matchConfidence = candidate.confidence,
+            displayTitle = savedEstimatePin.pinName,
+            displayCollection = savedEstimatePin.collection,
+            marketLowUsd = savedEstimatePin.marketLowUsd,
+            marketHighUsd = savedEstimatePin.marketHighUsd,
+            estMarketValueUsd = savedEstimatePin.estMarketValueUsd,
+            priceTier = savedEstimatePin.priceTier,
+            scrapperRisk = savedEstimatePin.scrapperRisk,
+            priceConfidence = savedEstimatePin.priceConfidence
         )
+    }
+
+    private fun downgradedSourceFor(det: ScannedPinResult): MatchSource {
+        return if (det.matchedPin != null && det.matchedPin.dataSource == "Seeded") {
+            MatchSource.LOCAL_DB
+        } else {
+            MatchSource.GEMINI_ESTIMATE
+        }
     }
 
     private fun persistPermanentCrop(pinId: String, tempPath: String): File {
@@ -439,5 +476,21 @@ class PinScanOrchestrator(
             src.copyTo(target, overwrite = true)
         }
         return target
+    }
+
+    companion object {
+        const val MAX_AUTO_VERIFY_PINS = 4
+
+        fun selectTopForVerification(
+            items: List<ScannedPinResult>,
+            maxPins: Int = MAX_AUTO_VERIFY_PINS
+        ): List<ScannedPinResult> {
+            return items
+                .sortedWith(
+                    compareByDescending<ScannedPinResult> { it.marketHighUsd }
+                        .thenBy { it.candidate.confidence }
+                )
+                .take(maxPins.coerceAtLeast(0))
+        }
     }
 }
