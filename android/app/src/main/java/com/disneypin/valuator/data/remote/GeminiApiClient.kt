@@ -57,15 +57,28 @@ object GeminiResponseParser {
     }
 
     fun extractJsonObject(rawText: String): JSONObject {
+        val cleaned = stripCodeFences(rawText)
+        val firstObj = cleaned.indexOf('{')
+        val firstArr = cleaned.indexOf('[')
+        if (firstArr in 0 until firstObj || (firstObj < 0 && firstArr >= 0)) {
+            val lastArr = cleaned.lastIndexOf(']')
+            if (lastArr > firstArr) {
+                val arr = JSONArray(cleaned.substring(firstArr, lastArr + 1))
+                return JSONObject().put("valuations", arr)
+            }
+        }
+        val lastBrace = cleaned.lastIndexOf('}')
+        if (firstObj < 0 || lastBrace <= firstObj) {
+            throw IllegalArgumentException("No JSON object found in Gemini response: ${cleaned.take(180)}")
+        }
+        return JSONObject(cleaned.substring(firstObj, lastBrace + 1))
+    }
+
+    private fun stripCodeFences(rawText: String): String {
         var cleaned = rawText.trim()
         cleaned = cleaned.replace(Regex("""^```(?:json)?\s*""", RegexOption.IGNORE_CASE), "")
         cleaned = cleaned.replace(Regex("""\s*```$"""), "")
-        val firstBrace = cleaned.indexOf('{')
-        val lastBrace = cleaned.lastIndexOf('}')
-        if (firstBrace < 0 || lastBrace <= firstBrace) {
-            throw IllegalArgumentException("No JSON object found in Gemini response")
-        }
-        return JSONObject(cleaned.substring(firstBrace, lastBrace + 1))
+        return cleaned.trim()
     }
 
     fun extractGroundingCitations(rawBody: String): List<PinValuationSource> {
@@ -134,7 +147,12 @@ object GeminiResponseParser {
         val list = mutableListOf<Pass2PinValuation>()
         for (i in 0 until arr.length()) {
             val item = arr.optJSONObject(i) ?: continue
-            val tempId = item.optInt("temp_id", i)
+            val rawTempId = item.opt("temp_id")
+            val tempId = when (rawTempId) {
+                is Number -> rawTempId.toInt()
+                is String -> Regex("""\d+""").find(rawTempId)?.value?.toIntOrNull() ?: i
+                else -> i
+            }
             val rawLow = item.optDouble("market_low_usd", 12.0)
             val rawHigh = item.optDouble("market_high_usd", rawLow)
             val (safeLow, safeHigh) = PinSanitizer.sanitizePriceRange(rawLow, rawHigh)
@@ -166,7 +184,7 @@ class GeminiApiClient {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
@@ -247,6 +265,7 @@ class GeminiApiClient {
             })
             put("generationConfig", JSONObject().apply {
                 put("temperature", 0.2)
+                put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
             })
         }
 

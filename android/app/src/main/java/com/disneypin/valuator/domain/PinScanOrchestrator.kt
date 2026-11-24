@@ -164,6 +164,7 @@ class PinScanOrchestrator(
         val pendingItems = workingPhotos.flatMap { photo ->
             photo.pins.filter { it.matchSource == MatchSource.PENDING_SEARCH }
         }
+        var pass2ErrorMessage: String? = null
 
         if (pendingItems.isNotEmpty()) {
             val chunks = pendingItems.chunked(5)
@@ -172,7 +173,8 @@ class PinScanOrchestrator(
                     ScanBatchState(
                         isScanning = true,
                         statusMessage = "Researching market prices (batch ${chunkIdx + 1}/${chunks.size})...",
-                        photos = workingPhotos.toList()
+                        photos = workingPhotos.toList(),
+                        errorMessage = pass2ErrorMessage
                     )
                 )
                 val requests = chunk.mapIndexedNotNull { idx, item ->
@@ -185,13 +187,19 @@ class PinScanOrchestrator(
                     )
                 }
 
+                var chunkError: String? = null
                 val valuations = runCatching {
                     geminiClient.researchPinValuations(requests, settings.geminiApiKey, settings.geminiModel)
-                }.getOrElse { emptyList() }
+                }.getOrElse { err ->
+                    android.util.Log.e("PinScanOrchestrator", "Pass 2 batch ${chunkIdx + 1} failed", err)
+                    chunkError = err.message ?: "Online price lookup failed"
+                    pass2ErrorMessage = chunkError
+                    emptyList()
+                }
 
                 val byTempId = valuations.associateBy { it.tempId }
                 chunk.forEachIndexed { idx, item ->
-                    val valResult = byTempId[idx]
+                    val valResult = byTempId[idx] ?: valuations.getOrNull(idx)
                     val updatedPinResult = if (valResult != null) {
                         val citationsJson = PinSanitizer.encodeCitationsJson(valResult.citations)
                         val savedPin = if (item.matchedPin != null) {
@@ -246,12 +254,13 @@ class PinScanOrchestrator(
                             priceTier = savedPin.priceTier,
                             scrapperRisk = savedPin.scrapperRisk,
                             priceConfidence = savedPin.priceConfidence,
-                            citations = valResult.citations
+                            citations = valResult.citations,
+                            errorNote = null
                         )
                     } else {
                         item.copy(
-                            matchSource = if (item.matchedPin != null) MatchSource.LOCAL_DB else MatchSource.GEMINI_SEARCH,
-                            errorNote = "Could not verify price online"
+                            matchSource = if (item.matchedPin != null) MatchSource.LOCAL_DB else MatchSource.PENDING_SEARCH,
+                            errorNote = chunkError ?: "No valuation returned for Pin #${idx + 1}"
                         )
                     }
 
@@ -280,9 +289,9 @@ class PinScanOrchestrator(
         emit(
             ScanBatchState(
                 isScanning = false,
-                statusMessage = "Completed",
+                statusMessage = if (pass2ErrorMessage == null) "Completed" else "Completed with lookup errors",
                 photos = persistedPhotos,
-                errorMessage = persistedPhotos.firstOrNull { it.errorMessage != null }?.errorMessage
+                errorMessage = pass2ErrorMessage ?: persistedPhotos.firstOrNull { it.errorMessage != null }?.errorMessage
             )
         )
     }

@@ -66,6 +66,34 @@ class LocalPinMatcherTest {
     }
 
     @Test
+    fun `matchByMetadata matches descriptive Marie Ear Headband to catalog Marie`() {
+        val mariePin = Pin(
+            pinId = "PIN-0081",
+            pinName = "Marie",
+            collection = "Hidden Disney",
+            subSet = "Ear Headbands",
+            resort = "DLR",
+            rarity = "Common",
+            marketLowUsd = 14.0,
+            marketHighUsd = 20.0,
+            estMarketValueUsd = 17.0,
+            priceTier = "Standard (<$20)",
+            priceUpdated = "2026-11-01"
+        )
+        val candidate = DetectedPinCandidate(
+            tempId = 1,
+            box2d = BoundingBoxNorm(200, 100, 350, 250),
+            pinName = "Marie Ear Headband",
+            character = "Marie",
+            collectionGuess = "Hidden Disney",
+            subSetGuess = "Ear Headbands"
+        )
+        val match = LocalPinMatcher.matchByMetadata(candidate, listOf(unrelatedPin, mariePin))
+        assertNotNull(match)
+        assertEquals("PIN-0081", match!!.first.pinId)
+    }
+
+    @Test
     fun `isPriceFresh respects 60 day threshold`() {
         val today = LocalDate.of(2026, 11, 23)
         assertTrue(LocalPinMatcher.isPriceFresh("2026-10-24", today, 60))

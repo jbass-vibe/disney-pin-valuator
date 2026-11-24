@@ -257,21 +257,43 @@ fun ScanResultScreen(
                                 }
 
                                 Column(horizontalAlignment = Alignment.End) {
-                                    if (det.matchSource == MatchSource.PENDING_SEARCH) {
-                                        Text(
-                                            text = "...",
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    } else {
-                                        Text(
-                                            text = "$${det.marketLowUsd.toInt()}–$${det.marketHighUsd.toInt()}",
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.ExtraBold,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
+                                    when {
+                                        det.matchSource == MatchSource.PENDING_SEARCH && det.errorNote == null -> {
+                                            Text(
+                                                text = "...",
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                        det.errorNote != null && det.estMarketValueUsd <= 0.0 -> {
+                                            Text(
+                                                text = "Unverified",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color(0xFFB71C1C)
+                                            )
+                                        }
+                                        else -> {
+                                            Text(
+                                                text = "$${det.marketLowUsd.toInt()}–$${det.marketHighUsd.toInt()}",
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
                                     }
                                 }
+                            }
+
+                            det.errorNote?.let { err ->
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = err,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFFB71C1C),
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
                             }
 
                             det.matchedPin?.let { pin ->
@@ -339,13 +361,15 @@ private fun AnnotatedPinPhoto(
             )
 
             pins.forEach { det ->
-                val isSearching = det.matchSource == MatchSource.PENDING_SEARCH
-                val isLowConf = det.priceConfidence == "Low Conf"
+                val isSearching = det.matchSource == MatchSource.PENDING_SEARCH && det.errorNote == null
+                val hasError = det.errorNote != null && det.estMarketValueUsd <= 0.0
+                val isLowConf = det.priceConfidence == "Low Conf" || hasError
                 val style = tierOverlayStyle(det.priceTier, isLowConf = isLowConf)
                 val pillLabel = when {
                     isSearching -> "..."
-                    det.priceTier.startsWith("Grail") -> "★ $${det.estMarketValueUsd.toInt()}+"
-                    det.priceTier.startsWith("High") -> "★ $${det.marketLowUsd.toInt()}-$${det.marketHighUsd.toInt()}"
+                    hasError -> "?"
+                    det.priceTier.startsWith("Grail") -> "★$${det.estMarketValueUsd.toInt()}+"
+                    det.priceTier.startsWith("High") -> "★$${det.marketLowUsd.toInt()}-$${det.marketHighUsd.toInt()}"
                     else -> "$${det.marketLowUsd.toInt()}-$${det.marketHighUsd.toInt()}"
                 }
 
@@ -356,17 +380,17 @@ private fun AnnotatedPinPhoto(
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopStart)
-                        .offset { IntOffset((pxX - 36).coerceIn(0, (containerW - 72).toInt()), (pxY - 22).coerceIn(0, (containerH - 28).toInt())) }
-                        .clip(RoundedCornerShape(10.dp))
+                        .offset { IntOffset((pxX - 24).coerceIn(0, (containerW - 48).toInt()), (pxY - 16).coerceIn(0, (containerH - 20).toInt())) }
+                        .clip(RoundedCornerShape(6.dp))
                         .background(style.bg)
-                        .border(if (isSelected) 2.dp else 1.dp, if (isSelected) Color.Cyan else style.border, RoundedCornerShape(10.dp))
+                        .border(if (isSelected) 2.dp else 1.dp, if (isSelected) Color.Cyan else style.border, RoundedCornerShape(6.dp))
                         .clickable { onPillClick(det) }
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                        .padding(horizontal = 4.dp, vertical = 1.dp)
                 ) {
                     Text(
                         text = pillLabel,
                         color = style.fg,
-                        fontSize = 10.sp,
+                        fontSize = 8.sp,
                         fontWeight = FontWeight.ExtraBold,
                         maxLines = 1
                     )

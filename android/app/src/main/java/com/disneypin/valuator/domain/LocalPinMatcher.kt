@@ -42,7 +42,7 @@ object LocalPinMatcher {
         val nameCand = "${candidate.pinName} ${candidate.character}"
         val nameScore = tokenOverlapWithSubstringBonus(nameCand, pin.pinName)
 
-        val colCand = "${candidate.collectionGuess} ${candidate.subSetGuess}"
+        val colCand = "${candidate.collectionGuess} ${candidate.subSetGuess} ${candidate.pinName}"
         val colTarget = "${pin.collection} ${pin.subSet}"
         val colScore = if (colCand.isBlank()) 0.5 else tokenOverlapWithSubstringBonus(colCand, colTarget)
 
@@ -91,17 +91,19 @@ object LocalPinMatcher {
 
         val intersection = tokensA.intersect(tokensB).size.toDouble()
         val union = tokensA.union(tokensB).size.toDouble()
+        val minSize = minOf(tokensA.size, tokensB.size).toDouble().coerceAtLeast(1.0)
         val jaccard = if (union > 0.0) intersection / union else 0.0
+        val containment = intersection / minSize
+        val blended = 0.60 * containment + 0.40 * jaccard
 
         val normA = a.lowercase().trim()
         val normB = b.lowercase().trim()
         val substringBonus = when {
-            normA.isNotEmpty() && normB.contains(normA) -> 0.35
-            normB.isNotEmpty() && normA.contains(normB) -> 0.35
-            intersection >= 1.0 && tokensA.any { it.length >= 4 && it in tokensB } -> 0.20
+            normA.isNotEmpty() && normB.contains(normA) -> 0.25
+            normB.isNotEmpty() && normA.contains(normB) -> 0.25
             else -> 0.0
         }
-        return max(jaccard, (jaccard * 0.75 + substringBonus)).coerceIn(0.0, 1.0)
+        return (blended + substringBonus).coerceIn(0.0, 1.0)
     }
 
     private fun tokenize(text: String): Set<String> {
