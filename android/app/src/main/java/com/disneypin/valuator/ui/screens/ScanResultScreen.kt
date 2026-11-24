@@ -80,6 +80,7 @@ import kotlin.math.roundToInt
 fun ScanResultScreen(
     batchState: ScanBatchState,
     onBack: () -> Unit,
+    onRetryScan: () -> Unit,
     onSelectDetection: (String?) -> Unit,
     onOpenPinDetail: (Pin) -> Unit,
     onRefreshPin: (Pin) -> Unit,
@@ -141,17 +142,35 @@ fun ScanResultScreen(
             }
 
             if (!batchState.errorMessage.isNullOrBlank()) {
-                Box(
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFFFFEBEE))
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
                         text = batchState.errorMessage,
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFFB71C1C)
+                        color = Color(0xFFB71C1C),
+                        modifier = Modifier.weight(1f).padding(end = 8.dp)
                     )
+                    if (!batchState.isScanning) {
+                        TextButton(onClick = onRetryScan) {
+                            Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = "Retry",
+                                tint = Color(0xFFB71C1C),
+                                modifier = Modifier.padding(end = 4.dp)
+                            )
+                            Text(
+                                text = "Retry",
+                                color = Color(0xFFB71C1C),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 }
             }
 

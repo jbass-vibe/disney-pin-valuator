@@ -173,6 +173,21 @@ class PinValuatorViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    fun retryCurrentScan() {
+        _isOnline.value = orchestrator.isOnline()
+        val current = _scanBatchState.value
+        viewModelScope.launch {
+            orchestrator.retryScanBatch(current, _settingsState.value).collect { state ->
+                _scanBatchState.value = state
+                if (!state.isScanning) {
+                    _catalogStats.value = repository.getCatalogStats()
+                    refreshCatalog()
+                    refreshScanHistory()
+                }
+            }
+        }
+    }
+
     fun openRecentScan(scanSummary: BoardScanSummary) {
         viewModelScope.launch {
             val detections = repository.getScanDetections(scanSummary.scanId)

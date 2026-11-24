@@ -96,6 +96,158 @@ class PinScanOrchestrator(
         }
     }.flowOn(Dispatchers.IO)
 
+    fun retryScanBatch(
+        previousState: ScanBatchState,
+        settings: AppSettings
+    ): Flow<ScanBatchState> = flow {
+        if (!isOnline() || settings.geminiApiKey.isBlank()) {
+            emit(
+                previousState.copy(
+                    isScanning = false,
+                    errorMessage = "Internet connection and Gemini API key required to retry."
+                )
+            )
+            return@flow
+        }
+        val failedPhotoFiles = previousState.photos
+            .filter { it.pins.isEmpty() && it.errorMessage != null }
+            .mapNotNull { photo ->
+                val bmp = ImageUtils.decodeNormalizedFile(photo.imagePath, maxEdgePx = 1600) ?: return@mapNotNull null
+                File(photo.imagePath) to bmp
+            }
+
+        if (failedPhotoFiles.isNotEmpty()) {
+            emitAllStages(failedPhotoFiles, settings).collect { emit(it) }
+            return@flow
+        }
+
+        // Otherwise Pass 1 succeeded and Pass 2 timed out / failed: re-run Pass 2 on top <= 4 pins
+        val allPins = previousState.photos.flatMap { it.pins }
+        val candidatesForVerify = selectTopForVerification(
+            allPins.filter {
+                it.matchSource == MatchSource.GEMINI_ESTIMATE || it.matchSource == MatchSource.PENDING_SEARCH
+            },
+            MAX_AUTO_VERIFY_PINS
+        )
+        if (candidatesForVerify.isEmpty()) {
+            val allPhotos = previousState.photos.mapNotNull { photo ->
+                val bmp = ImageUtils.decodeNormalizedFile(photo.imagePath, maxEdgePx = 1600) ?: return@mapNotNull null
+                File(photo.imagePath) to bmp
+            }
+            if (allPhotos.isNotEmpty()) {
+                emitAllStages(allPhotos, settings).collect { emit(it) }
+            }
+            return@flow
+        }
+
+        emit(
+            previousState.copy(
+                isScanning = true,
+                statusMessage = "Retrying online verification for top ${candidatesForVerify.size} pin(s)...",
+                errorMessage = null
+            )
+        )
+
+        val workingPhotos = previousState.photos.toMutableList()
+        val requests = candidatesForVerify.mapIndexedNotNull { idx, item ->
+            val bmp = ImageUtils.decodeNormalizedFile(item.cropImagePath, maxEdgePx = 192) ?: return@mapIndexedNotNull null
+            Pass2CropRequest(
+                tempId = idx,
+                jpegBase64 = ImageUtils.bitmapToJpegBase64(bmp, quality = 75),
+                pass1Hint = "${item.candidate.pinName} ${item.candidate.collectionGuess} ${item.candidate.subSetGuess}".trim(),
+                existingCatalogName = item.matchedPin?.pinName
+            )
+        }
+
+        val valuationsResult = runCatching {
+            geminiClient.researchPinValuations(requests, settings.geminiApiKey, settings.geminiModel)
+        }
+
+        if (valuationsResult.isFailure) {
+            val err = valuationsResult.exceptionOrNull()
+            emit(
+                previousState.copy(
+                    isScanning = false,
+                    statusMessage = "Retry failed (Pass 1 estimates)",
+                    errorMessage = "${err?.message ?: "Online verification unavailable"} — tap Retry to try again."
+                )
+            )
+            return@flow
+        }
+
+        val valuations = valuationsResult.getOrDefault(emptyList())
+        val byTempId = valuations.associateBy { it.tempId }
+        candidatesForVerify.forEachIndexed { idx, item ->
+            val valResult = byTempId[idx] ?: valuations.getOrNull(idx) ?: return@forEachIndexed
+            val citationsJson = PinSanitizer.encodeCitationsJson(valResult.citations)
+            val savedPin = if (item.matchedPin != null) {
+                repository.updatePinValuation(
+                    pinId = item.matchedPin.pinId,
+                    lowUsd = valResult.marketLowUsd,
+                    highUsd = valResult.marketHighUsd,
+                    confidence = valResult.priceConfidence,
+                    scrapperRisk = valResult.scrapperRisk,
+                    sourcesJson = citationsJson,
+                    referenceImagePath = item.cropImagePath
+                ) ?: item.matchedPin
+            } else {
+                repository.upsertLearnedPin(
+                    LearnedPinInput(
+                        pinName = valResult.pinName,
+                        collection = valResult.collection,
+                        subSet = valResult.subSet,
+                        resort = valResult.resort,
+                        yearWave = valResult.yearWave,
+                        rarity = valResult.rarity,
+                        marketLowUsd = valResult.marketLowUsd,
+                        marketHighUsd = valResult.marketHighUsd,
+                        priceConfidence = valResult.priceConfidence,
+                        scrapperRisk = valResult.scrapperRisk,
+                        visualTags = valResult.visualTags.ifBlank { item.candidate.visualTags },
+                        notes = valResult.notes,
+                        dataSource = "Gemini Search",
+                        referenceImagePath = item.cropImagePath,
+                        valuationSourcesJson = citationsJson
+                    )
+                )
+            }
+
+            val updated = item.copy(
+                matchedPin = savedPin,
+                matchSource = MatchSource.GEMINI_SEARCH,
+                matchConfidence = 0.90,
+                displayTitle = savedPin.pinName,
+                displayCollection = savedPin.collection,
+                marketLowUsd = savedPin.marketLowUsd,
+                marketHighUsd = savedPin.marketHighUsd,
+                estMarketValueUsd = savedPin.estMarketValueUsd,
+                priceTier = savedPin.priceTier,
+                scrapperRisk = savedPin.scrapperRisk,
+                priceConfidence = savedPin.priceConfidence,
+                citations = valResult.citations,
+                errorNote = null
+            )
+            val pIdx = updated.photoIndex
+            if (pIdx in workingPhotos.indices) {
+                val photo = workingPhotos[pIdx]
+                workingPhotos[pIdx] = photo.copy(
+                    pins = photo.pins.map { if (it.detectionId == updated.detectionId) updated else it }
+                )
+            }
+        }
+
+        emit(
+            ScanBatchState(
+                isScanning = false,
+                statusMessage = "Completed",
+                photos = workingPhotos.toList(),
+                selectedPhotoIndex = previousState.selectedPhotoIndex,
+                selectedDetectionId = previousState.selectedDetectionId,
+                errorMessage = null
+            )
+        )
+    }.flowOn(Dispatchers.IO)
+
     private fun emitAllStages(
         photos: List<Pair<File, Bitmap>>,
         settings: AppSettings

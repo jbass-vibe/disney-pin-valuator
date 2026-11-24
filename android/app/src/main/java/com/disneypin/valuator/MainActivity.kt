@@ -200,6 +200,7 @@ fun DisneyPinValuatorApp(viewModel: PinValuatorViewModel = viewModel()) {
                 ScanResultScreen(
                     batchState = scanBatchState,
                     onBack = { navController.popBackStack() },
+                    onRetryScan = viewModel::retryCurrentScan,
                     onSelectDetection = viewModel::selectScanDetection,
                     onOpenPinDetail = { pin ->
                         viewModel.selectPin(pin)
