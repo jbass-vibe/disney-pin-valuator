@@ -35,7 +35,7 @@ Before writing new code, review what already exists in `android/app/src/main/jav
 
 ---
 
-## 2. Target Architecture (Local-First + Gemini Hybrid)
+## 2. Target Architecture (Local-First + 1–2 Call Gemini Hybrid)
 
 ```
  [ User: Take Photo / Upload 1..10 Photos ]
@@ -44,32 +44,37 @@ Before writing new code, review what already exists in `android/app/src/main/jav
         [ ImageUtils (EXIF + <=1600px) ]
                      |
         +------------+------------+
-        | (Offline?)              | (Online + API Key)
+        | (Offline?)              | (Online + API Key, Sequential Pacer >=4s)
         v                         v
- [ Queue to pending_scans ]  [ GeminiApiClient: Pass 1 (Vision) ]
- [ + Local FTS5 / Cache   ]  (gemini-2.5-flash, JSON, thinkingBudget=0,
-                              NO web search -> box_2d[0..1000] + attrs)
+ [ Queue to pending_scans ]  [ GeminiApiClient: Pass 1 (1 Call / Photo) ]
+ [ + Local FTS / Cache    ]  (JSON, no search, maxOutputTokens=4096 ->
+                              box_2d + attrs + est_low/high_usd + needs_web_verification)
                                   |
                                   v
                      [ Crop each pin box -> Bitmap ]
                                   |
                                   v
-            [ LocalPinMatcher (Pass 0 Visual + FTS5 Metadata) ]
-                 |                                      |
-      (Local Hit & Fresh <=60d)              (Miss OR Stale >60d)
-                 |                                      |
-                 v                                      v
-      [ Emit Result Immediately ]       [ GeminiApiClient: Pass 2 (Search) ]
-      [ source = LOCAL_DB       ]       (batched <=5 crops + google_search tool)
-                                                        |
-                                                        v
+            [ LocalPinMatcher (Pass 0 Visual + FTS Metadata) ]
+                 |                     |                         |
+        (Local Hit & Fresh)   (Common/Confident Miss)   (High-Value >=$25 OR
+                 |             needs_web_verification=F  Uncertain <0.70 OR Stale)
+                 v                     v                         |
+      [ LOCAL_DB / VISUAL ]   [ GEMINI_ESTIMATE ]                v
+      [ 0 extra API calls ]   [ Save to SQLite  ]   [ Select Top <=4 Pins ]
+                              [ 0 extra calls   ]   [ AT MOST 1 Pass 2 Call ]
+                                                    (192px crops + google_search
+                                                     + maxOutputTokens=2048)
+                                                         |
+                                                    (Success? / Circuit Breaker)
+                                                         v
                                         [ Knowledge Extension Write-Back ]
                                         - INSERT new pin (GEM-XXXX) OR UPDATE price
                                         - SQLite triggers update pins_fts & price_history
                                         - Save crop JPEG to filesDir/pin_crops/
                                         - Store hsv-dhash-v1 BLOB in pin_embeddings
-                                                        |
-                                                        v
+                                        - On 429/503/Timeout: keep Pass 1 Gemini Est.!
+                                                         |
+                                                         v
                      [ Log to board_scans & scan_detections ]
                                   |
                                   v
@@ -234,126 +239,144 @@ Given a Pass 1 detection (`DetectedPinCandidate`) and its cropped `Bitmap`:
 `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
 * Pass API key via HTTP header `x-goog-api-key: <apiKey>` (preferred over URL query string so keys don't leak into logs).
 * Default `model`: `"gemini-2.5-flash"` (configurable in Settings).
-* OkHttp timeouts: `connectTimeout = 15s`, `readTimeout = 45s`, `writeTimeout = 30s`.
-* Retry HTTP `429` and `503` up to 2 times with backoff (`1500ms`, `3500ms`).
+* **Separate OkHttp Timeouts:**
+  * Pass 1 (`detectPinsInPhoto`): `connectTimeout = 15s`, `readTimeout = 45s`, `writeTimeout = 30s`.
+  * Pass 2 (`researchPinValuations`): `connectTimeout = 15s`, `readTimeout = 60s`, `writeTimeout = 30s`.
+* **Global Request Pacer (`Mutex` + timestamp):** Track `lastRequestCompletedAtMs` inside `GeminiApiClient`. Before sending any request, enforce a minimum spacing of **`4_000 ms`** since the previous request finished (unless it is the first call). This prevents burst RPM spikes during Pass 1 → Pass 2 transitions and multi-photo batches.
+* **Strict Retry & Error Policy (`executeWithPacingAndRetry`):**
+  * **NEVER retry** `SocketTimeoutException` / `InterruptedIOException` (fail fast and fall back to Pass 1 estimates instead of hanging 3×90s).
+  * **NEVER retry** HTTP `400`, `401`, `403`, or `404` (on `404`, return `"Model '$model' not found — check Settings"`).
+  * **HTTP `429` or `503`:** Perform **at most 1 retry** (`maxRetries = 1`). Read the `Retry-After` response header (in seconds) if present and wait `retryAfterSec.coerceIn(5, 25) * 1000L`; otherwise wait **`10_000 ms`** (`10s`).
+  * Throw a typed `GeminiRateLimitException(code, message)` when `429` or `503` still fails after 1 retry so `PinScanOrchestrator` can trip its **batch circuit breaker** immediately.
+* **Thinking Config Helper:** Only attach `"thinkingConfig": { "thinkingBudget": 0 }` when `model.contains("2.5")`. For Gemini 3.x+ models (e.g., `gemini-3.8-flash`), omit `thinkingBudget` or use `"thinkingConfig": { "thinkingLevel": "minimal" }` if supported, and ALWAYS set `maxOutputTokens` to prevent 13K+ token spikes.
 
-### 6.1 Pass 1 — Fast Multi-Pin Detection & Attribute Extraction
+### 6.1 Pass 1 — Fast Single-Call Board Detection + Initial Valuation
 * **Tools:** NONE (no web search — maximizes speed and bounding-box accuracy).
 * **Generation Config:**
   ```json
   {
     "temperature": 0.1,
+    "maxOutputTokens": 4096,
     "responseMimeType": "application/json",
     "thinkingConfig": { "thinkingBudget": 0 }
   }
   ```
 * **Request `contents`:** `[ { "parts": [ { "inline_data": { "mime_type": "image/jpeg", "data": "<BASE64_1600PX_JPEG>" } }, { "text": "<PASS_1_PROMPT>" } ] } ]`
 * **Prompt Instructions (`PASS_1_PROMPT`):**
-  > You are a Disneyland / Walt Disney World collectible pin expert. Detect EVERY Disney trading pin visible in this image (up to 25 pins). Return ONLY valid JSON matching:
-  > `{ "pins": [ { "box_2d": [ymin, xmin, ymax, xmax], "pin_name": "short character or subject name", "character": "main Disney character if any", "collection_guess": "e.g. Hidden Disney, Cast Hidden Disney, Disney Ice Cream, Attractions Alphabet, Open Edition", "sub_set_guess": "e.g. Ear Headbands, Ear Hats, Disneyland D, Film Anniversaries, Cupcakes, Sundaes", "resort_guess": "DLR or WDW or Unknown", "rarity_hint": "Common | Chaser / Completer | Super Chaser", "visual_tags": "comma-separated visual traits e.g. red Disneyland D frame, silver Hidden Mickey, purple hexagon", "has_hidden_mickey": true, "confidence": 0.85, "scrapper_risk_hint": "Low | Medium | High", "scrapper_notes": "brief visual note if dipped enamel/rough edges visible, else empty" } ] }`
-  > Rules: `box_2d` coordinates MUST be integers normalized to `0..1000` (`[ymin, xmin, ymax, xmax]`). Do not merge adjacent pins into one box.
+  > You are a Disneyland / Walt Disney World collectible pin expert. Detect EVERY Disney trading pin visible in this image (up to 25 pins) AND provide an immediate realistic USD secondary-market estimate for each pin. Return ONLY valid JSON matching:
+  > `{ "pins": [ { "box_2d": [ymin, xmin, ymax, xmax], "pin_name": "short character or subject name", "character": "main Disney character if any", "collection_guess": "e.g. Hidden Disney, Cast Hidden Disney, Open Edition, Limited Edition", "sub_set_guess": "e.g. Ear Headbands, Ear Hats, Disneyland D, Film Anniversaries, Cupcakes, Sundaes", "resort_guess": "DLR or WDW or Unknown", "rarity_hint": "Common | Chaser / Completer | Super Chaser", "est_low_usd": 10.0, "est_high_usd": 16.0, "needs_web_verification": false, "visual_tags": "comma-separated visual traits", "has_hidden_mickey": true, "confidence": 0.85, "scrapper_risk_hint": "Low | Medium | High", "scrapper_notes": "brief visual note if defects visible, else empty" } ] }`
+  > Rules: `box_2d` coordinates MUST be integers normalized to `0..1000` (`[ymin, xmin, ymax, xmax]`). Do not merge adjacent pins into one box. Set `needs_web_verification: true` ONLY if the pin appears rare, Limited Edition, Chaser/Super Chaser, likely worth >= $25 USD, OR your identification confidence is < 0.70. Set `needs_web_verification: false` for standard/common open-edition or lanyard pins.
 
-### 6.2 Pass 2 — Search-Grounded Identification & Valuation (Fallback Only)
-* **Triggered ONLY for:** `MatchOutcome.Unmatched`, `MatchOutcome.LocalStale`, or manual **"Refresh Price"**.
-* **Batching:** Up to **5 cropped pin images** per API call (each crop labeled `Pin #0`, `Pin #1`, ... with its Pass 1 guess and, if stale, its existing catalog name).
+### 6.2 Pass 2 — Selective, Capped Search-Grounded Valuation (Max 1 Call / Board)
+* **Triggered ONLY when:** `settings.autoVerifyOnline == true` AND there are pins that are (a) `Unmatched` with `needsWebVerification == true` (or `estHighUsd >= 25.0`, `rarityHint != "Common"`, or `confidence < 0.70`), OR (b) `LocalStale` (`> stalePriceDays`), OR (c) explicit user tap on **"Verify/Refresh Online"**.
+* **Hard Cap:** Select **at most 4 pins per board** for automatic Pass 2 (sorted by `estHighUsd` descending, then `confidence` ascending) and send them in **1 single batched call**. Do NOT loop through multiple Pass 2 chunks automatically!
+* **Compact Crop Size:** Decode Pass 2 crops at **`maxEdgePx = 192`**, JPEG quality `75` to keep input tokens small and server latency low.
 * **Tools:** `"tools": [{ "google_search": {} }]`
-* **Generation Config:** `{ "temperature": 0.2 }` — **DO NOT set `responseMimeType: "application/json"` when `google_search` tool is enabled** (can trigger HTTP 400 on Gemini 2.5 models).
+* **Generation Config:** `{ "temperature": 0.2, "maxOutputTokens": 2048 }` — **DO NOT set `responseMimeType: "application/json"` when `google_search` tool is enabled**.
 * **Prompt Instructions (`PASS_2_PROMPT`):**
-  > Use Google Search to identify each numbered Disney pin crop and find its current secondary market value in USD from recent eBay sold listings, Mercari, and Disney pin collector guides. Return ONLY a single JSON object (no prose before or after):
-  > `{ "valuations": [ { "temp_id": 0, "pin_name": "Official or commonly traded pin name", "collection": "Series or collection name", "sub_set": "Sub-set name or empty string", "resort": "DLR | WDW | DLR/WDW | Other", "year_wave": "Year or wave e.g. 2025 Wave A or 2023", "rarity": "Common | Chaser / Completer | Super Chaser", "market_low_usd": 14.0, "market_high_usd": 22.0, "price_confidence": "Verified | Peer Est. | Low Conf", "scrapper_risk": "Low | Medium | High", "visual_tags": "concise comma-separated visual descriptors", "notes": "1-sentence valuation & edition summary (e.g. LE 500, Hidden Mickey series, recent eBay comps)" } ] }`
+  > Use Google Search to quickly verify each numbered Disney pin crop and its current USD secondary market value (eBay sold listings, Mercari, PinPics). Keep search concise and return ONLY a single compact JSON object (no prose before or after):
+  > `{ "valuations": [ { "temp_id": 0, "pin_name": "Official or commonly traded pin name", "collection": "Series or collection name", "sub_set": "Sub-set name or empty string", "resort": "DLR | WDW | DLR/WDW | Other", "year_wave": "Year or wave e.g. 2025 Wave A", "rarity": "Common | Chaser / Completer | Super Chaser", "market_low_usd": 14.0, "market_high_usd": 22.0, "price_confidence": "Verified | Peer Est. | Low Conf", "scrapper_risk": "Low | Medium | High", "visual_tags": "concise comma-separated visual descriptors", "notes": "1-sentence valuation & edition summary" } ] }`
 * **Defensive Response Parsing:**
   1. Concatenate all `candidates[0].content.parts[].text`.
-  2. Strip markdown fences (` ```json ... ``` `) and extract the substring from the first `{` to the matching last `}`.
+  2. Strip markdown fences (` ```json ... ``` `) and extract the JSON object (or array wrapped into `{"valuations": [...]}`).
   3. Extract citation sources from `candidates[0].groundingMetadata.groundingChunks[]` (`chunk.web.uri` + `chunk.web.title`), deduplicate, and store up to 5 `{title, url}` objects as JSON in `pins.valuation_sources`.
   4. Sanitize every numeric & enum field (`marketLowUsd >= 0`, `marketHighUsd = max(low, high)`, map invalid `rarity`/`priceConfidence`/`scrapperRisk` to safe defaults).
 
 ---
 
-## 7. Phased Implementation Roadmap (5 Ordered Phases)
+## 7. Phased Implementation Roadmap
 
-Execute phases **strictly in order**. Do not proceed to the next phase until the current phase's verification checks pass.
+> **Note:** Phases 1–5 (v2.0) are already implemented as of commit `c876d3a`. **Phase 6 (v2.1 Delta)** below contains the exact incremental changes to implement next.
 
-### Phase 1: Configuration, Database Migration & Repository Write Layer
-**Files to create/edit:**
-* `android/app/build.gradle.kts` — add OkHttp, ExifInterface, `buildConfig`, `testImplementation("org.json:json:20240303")`.
-* `android/app/src/main/AndroidManifest.xml` — add `INTERNET` and `ACCESS_NETWORK_STATE`.
-* `data/settings/SettingsRepository.kt` *(NEW)* — `SharedPreferences` wrapper for `geminiApiKey` (falling back to `BuildConfig.DEFAULT_GEMINI_API_KEY`), `geminiModel` (default `"gemini-2.5-flash"`), `stalePriceDays` (default `60`).
-* `data/model/PinModels.kt` — extend `Pin` with `dataSource`, `referenceImagePath`, `valuationSources`; add `BoundingBoxNorm`, `DetectedPinCandidate`, `PinValuationSource`, `ScannedPinResult`, `MatchSource` (`LOCAL_VISUAL`, `LOCAL_DB`, `GEMINI_SEARCH`, `PENDING_SEARCH`), `BoardScanSummary`, `PendingScanItem`, `PinEmbeddingRecord`.
-* `data/db/PinDatabaseHelper.kt` — enable `PRAGMA foreign_keys = ON`; add idempotent `user_version = 2` migration.
-* `data/db/PinRepository.kt` — fix `getPriceHistory()` column bug; implement `upsertLearnedPin()`, `updatePinValuation()`, `upsertPinEmbedding()`, `getAllPinEmbeddings()`, `saveBoardScan()`, `getRecentBoardScans()`, `getScanDetections()`, `queuePendingScan()`, `getPendingScans()`, `deletePendingScan()`, and source filter in `searchPins()`.
-
-**Phase 1 Verification:**
-* Unit tests in `PinRepositorySanitizationTest.kt` verifying enum normalization, `GEM-XXXX` ID formatting, and `price_history` column mapping.
-* `./gradlew testDebugUnitTest` passes.
+### Phases 1–5 (Completed in v2.0 — Reference Only)
+* **Phase 1:** Gradle/Manifest setup, `SettingsRepository`, `PinDatabaseHelper` (`user_version = 2` + FTS4 migration in `8391d34`), `PinRepository` write layer & `price_history` fix.
+* **Phase 2:** `ImageUtils`, `VisualFingerprint` (`hsv-dhash-v1`), `LocalPinMatcher`.
+* **Phase 3:** `GeminiApiClient`, `PinScanOrchestrator`.
+* **Phase 4:** `ScanHomeScreen`, `ScanResultScreen`, `SettingsDialog`, `EditPinDialog`, `MyPinsScreen`, `ManualAppraisalScreen`, 3-tab `MainActivity`.
+* **Phase 5:** Initial unit tests (`EvaluationEngineTest`, `LocalPinMatcherTest`, `VisualFingerprintTest`, `GeminiParserTest`, `PinRepositorySanitizationTest`) and debug APK build.
 
 ---
 
-### Phase 2: Image Preprocessing, Visual Fingerprinting & Local Matcher
-**Files to create:**
-* `domain/ImageUtils.kt` *(NEW)* — EXIF-aware bitmap decode & downscale to `<= 1600px` JPEG; base64 encoding; `descaleBoundingBox(box2d, width, height)` clamping `[0..1000]` safely to image bounds with 6% padding; `cropAndSavePinThumbnail(bitmap, box2d, outFile, maxDim = 320)`.
-* `domain/VisualFingerprint.kt` *(NEW)* — Pure-Kotlin `compute(bitmap): ByteArray` (200-byte `hsv-dhash-v1`) and `similarity(a: ByteArray, b: ByteArray): Double`.
-* `domain/LocalPinMatcher.kt` *(NEW)* — Pure-Kotlin scoring engine (`matchByVisual()`, `matchByMetadata()`, `isPriceFresh(priceUpdated, today, staleDays)`).
+### Phase 6 (v2.1 Delta): API Efficiency, Smart Batching & Rate-Limit Protection
 
-**Phase 2 Verification:**
-* Unit tests in `LocalPinMatcherTest.kt` and `VisualFingerprintTest.kt`:
-  - Bounding box `[100, 200, 300, 400]` on `1000x2000` image maps cleanly and clamps out-of-range inputs (`-50`, `1200`).
-  - `VisualFingerprint.similarity(a, a) == 1.0`; distinct bitmaps score `< 0.6`.
-  - `LocalPinMatcher` matches `"Hippo"` + `"Disneyland D"` to `PIN-0518` (`>= 0.72`) and rejects unrelated pins (`< 0.50`).
-  - Stale-date calculation correctly classifies `30 days` as fresh and `90 days` as stale when threshold is `60`.
+Execute these exact edits on top of the current `main` branch (`c876d3a`):
 
----
+#### Step 6.1 — Models & Settings (`PinModels.kt`, `SettingsRepository.kt`, `SettingsDialog.kt`)
+1. **`PinModels.kt`:**
+   * Add `val autoVerifyOnline: Boolean = true` to `AppSettings`.
+   * Add three fields to `DetectedPinCandidate` (with safe defaults so existing tests still compile):
+     ```kotlin
+     val estLowUsd: Double = 10.0,
+     val estHighUsd: Double = 16.0,
+     val needsWebVerification: Boolean = false
+     ```
+   * Add `GEMINI_ESTIMATE("Gemini Est.")` to `MatchSource` enum (between `LOCAL_DB` and `GEMINI_SEARCH`).
+2. **`SettingsRepository.kt`:**
+   * Persist `KEY_AUTO_VERIFY_ONLINE = "auto_verify_online"` (default `true`) in `loadSettings()` and `saveSettings(...)`.
+3. **`SettingsDialog.kt` & `PinValuatorViewModel.kt`:**
+   * Add a `Switch` row in `SettingsDialog`: **"Auto-verify top high-value pins online (max 1 search call/board)"** bound to `autoVerifyOnline`.
+   * Update `onSave` callback signature to pass `autoVerifyOnline: Boolean`.
 
-### Phase 3: Gemini REST Client & Hybrid Scan Orchestrator
-**Files to create:**
-* `data/remote/GeminiApiClient.kt` *(NEW)* — Implements `detectPinsInPhoto(jpegBase64, apiKey, model)` (Pass 1) and `researchPinValuations(cropsWithHints, apiKey, model)` (Pass 2 with `google_search`), defensive JSON parser (`extractJsonObject()`), `groundingChunks` citation extraction, and HTTP 429/503 exponential backoff.
-* `domain/PinScanOrchestrator.kt` *(NEW)* — Coordinates single or multi-photo scan batches:
-  1. Checks connectivity & API key; if unavailable, saves photos to `pending_scans` and emits offline state.
-  2. Runs Pass 1 per photo (bounded concurrency `Semaphore(2)`).
-  3. Crops each detected pin and runs `LocalPinMatcher`.
-  4. Immediately emits progressive `ScanBatchState` with all `LOCAL_DB` / `LOCAL_VISUAL` hits populated and unresolved pins marked `PENDING_SEARCH`.
-  5. Chunks unresolved/stale pins into batches of `<= 5` and calls Pass 2 (`researchPinValuations`).
-  6. Writes every Pass 2 pin back into SQLite (`upsertLearnedPin` + saves crop JPEG + `upsertPinEmbedding`), logs `board_scans` & `scan_detections`, and emits final `ScanBatchState` sorted descending by `estMarketValueUsd`.
-  7. Exposes `refreshSinglePin(pin, cropFile?)` for one-tap online price refreshes from results or Pin Detail.
+#### Step 6.2 — Rate-Limit-Safe Client (`GeminiApiClient.kt`)
+1. Add typed exception:
+   ```kotlin
+   class GeminiRateLimitException(val httpCode: Int, message: String) : IOException(message)
+   ```
+2. Add a global request pacer inside `GeminiApiClient`:
+   * `private val paceMutex = Mutex()`
+   * `private var lastRequestEndMs = 0L`
+   * `private val minRequestIntervalMs = 4_000L`
+   * Before every HTTP call, acquire `paceMutex`, delay if `System.currentTimeMillis() - lastRequestEndMs < minRequestIntervalMs`, execute the call, and update `lastRequestEndMs = System.currentTimeMillis()` in a `finally` block.
+3. Split OkHttp timeouts:
+   * Pass 1 client: `readTimeout(45, TimeUnit.SECONDS)`
+   * Pass 2 client: `readTimeout(60, TimeUnit.SECONDS)`
+4. Update `buildThinkingConfig(model)` helper:
+   * Only add `"thinkingConfig": { "thinkingBudget": 0 }` when `model.contains("2.5")`.
+   * Always add `"maxOutputTokens": 4096` to Pass 1 and `"maxOutputTokens": 2048` to Pass 2.
+5. Update `PASS_1_PROMPT` and `GeminiResponseParser.parsePass1Response()`:
+   * Add `est_low_usd`, `est_high_usd`, `needs_web_verification` to `PASS_1_PROMPT` (Section 6.1).
+   * Parse `estLowUsd` / `estHighUsd` via `PinSanitizer.sanitizePriceRange(...)` (default `10.0..16.0` if omitted) and `needsWebVerification = item.optBoolean("needs_web_verification", false)`.
+6. Replace `executeWithRetry()` with strict retry rules:
+   * **0 retries** on `SocketTimeoutException` / `InterruptedIOException` (rethrow immediately with `"Request timed out — using local/initial estimates"`).
+   * **0 retries** on HTTP `400`/`401`/`403`/`404` (on `404`, message `"Gemini model '$model' not found — check Settings"`).
+   * **At most 1 retry** on HTTP `429`/`503`: parse `resp.header("Retry-After")?.toLongOrNull()?.coerceIn(5L, 25L)?.times(1000L) ?: 10_000L`, delay once, and if it fails again throw `GeminiRateLimitException(resp.code, ...)`.
 
-**Phase 3 Verification:**
-* Unit tests in `GeminiParserTest.kt`:
-  - Parses valid Pass 1 multi-pin JSON response (15 pins).
-  - Parses Pass 2 response wrapped in ```` ```json ... ``` ```` with leading/trailing prose and extracts `groundingMetadata.groundingChunks`.
-  - Sanitizes invalid rarity (`"LE 300"` → `"Super Chaser"`), swapped prices (`low=40, high=20` → `low=20, high=40`), and missing optional fields without crashing.
+#### Step 6.3 — Smart 1–2 Call Orchestrator (`PinScanOrchestrator.kt`)
+1. **Sequential Photo Processing:** Remove `Semaphore(2)` + `async/awaitAll` for Pass 1 in `emitAllStages()`. Process `photos` sequentially (`for ((photoIdx, pair) in photos.withIndex())`) emitting `"Scanning photo ${photoIdx + 1}/${photos.size}..."` so Pass 1 calls never fire concurrently.
+2. **Immediate Pass 1 Valuation + Persistence for Standard Pins:**
+   In `resolveLocally(...)`, when neither visual cache nor FTS metadata matches:
+   * Compute `shouldVerify = candidate.needsWebVerification || candidate.estHighUsd >= 25.0 || candidate.rarityHint != "Common" || candidate.confidence < 0.70`.
+   * Compute immediate mid & tier from `(candidate.estLowUsd, candidate.estHighUsd)`.
+   * Persist the pin immediately to SQLite via `repository.upsertLearnedPin(...)` with `dataSource = "Gemini Estimate"`, `priceConfidence = "Peer Est."`, plus permanent crop & `hsv-dhash-v1` embedding — so even if Pass 2 is skipped or fails, the pin is already priced, clickable, and saved offline!
+   * Return `ScannedPinResult` with:
+     - `matchedPin = savedPin`, `marketLowUsd`, `marketHighUsd`, `estMarketValueUsd`, `priceTier` populated immediately!
+     - `matchSource = if (shouldVerify && settings.autoVerifyOnline) MatchSource.PENDING_SEARCH else MatchSource.GEMINI_ESTIMATE`.
+3. **Selective, Hard-Capped Pass 2 (Max 1 Call per Board, Top `<= 4` Pins):**
+   * Collect all `PENDING_SEARCH` items across the batch.
+   * Take **only the top `MAX_AUTO_VERIFY_PINS = 4`** items sorted by `compareByDescending<ScannedPinResult> { it.marketHighUsd }.thenBy { it.candidate.confidence }`.
+   * Any remaining `PENDING_SEARCH` items beyond the top 4 are immediately downgraded to `MatchSource.GEMINI_ESTIMATE` (keeping their Pass 1 prices) — **no extra Pass 2 chunks!**
+   * Decode Pass 2 crops at **`maxEdgePx = 192`, `quality = 75`**.
+   * Issue **1 single call** to `geminiClient.researchPinValuations(...)`.
+   * **Graceful Fallback / Circuit Breaker:** If that call fails (`GeminiRateLimitException`, timeout, or any error):
+     - Set a concise non-blocking `pass2ErrorMessage` (e.g., `"Rate limit reached — showing Pass 1 estimates. Tap Refresh on any pin to verify online."`).
+     - Downgrade all `PENDING_SEARCH` pins cleanly to `if (item.matchedPin != null && item.matchedPin.dataSource == "Seeded") MatchSource.LOCAL_DB else MatchSource.GEMINI_ESTIMATE` so **zero pins stay stuck on `"Searching..."`**.
 
----
+#### Step 6.4 — UI Source Badge Update (`ScanResultScreen.kt` / `PinComponents.kt`)
+1. Handle `MatchSource.GEMINI_ESTIMATE` cleanly in `ScanResultScreen.kt` (e.g., badge text `"Gemini Est."` with a subtle amber/blue tint, and price pill showing the Pass 1 `$low-$high` immediately rather than `"..."`).
+2. Ensure the per-pin **Refresh** icon button works on `GEMINI_ESTIMATE` pins so the user can manually trigger a 1-pin `google_search` verification anytime.
 
-### Phase 4: Trade-First UI Refactor & ViewModel Integration
-**Files to create/edit:**
-* `ui/viewmodel/PinValuatorViewModel.kt` — Inject/instantiate `SettingsRepository`, `GeminiApiClient`, `PinScanOrchestrator`; expose `scanBatchState`, `recentScans`, `pendingScans`, `settingsState`, `selectedSourceFilter`; add actions `scanPhotos(uris)`, `processPendingQueue()`, `openRecentScan(scanId)`, `refreshPinOnline(pin)`, `updatePinManually(...)`, `saveSettings(...)`.
-* `ui/screens/ScanHomeScreen.kt` *(NEW — default home tab)* — Clean hero card with **Take Photo** (`TakePicture`) and **Upload Photos** (`PickMultipleVisualMedia(maxItems = 10)`), inline API-key setup prompt if key is blank, Offline Queue banner with **"Process Queued Scans"** button if `pendingScans.isNotEmpty()`, and **Recent Scans** list.
-* `ui/screens/ScanResultScreen.kt` *(NEW)* —
-  - Top bar showing batch summary (`"18 pins found • 2 Grails • 3 High"` + progress bar while Pass 2 runs).
-  - `HorizontalPager` for multi-photo batches displaying `AnnotatedPinPhoto`: renders the photo with `ContentScale.Fit`, computes exact displayed image rect, and draws high-contrast clickable price pills (`★ $50+`, `★ $30-$49`, `$20-$29`, `<$20`, `...` while searching) at each pin's normalized `[ymin, xmin, ymax, xmax]` center-bottom.
-  - Below photo: **Trade Priority List** sorted highest `estMarketValueUsd` first across all photos in the batch, highlighting the tapped pill's card, displaying thumbnail crop, price range, tier badge, `Local DB` / `Gemini Web` pill, scrapper warning, and quick buttons (**Details**, **Refresh**, **Edit**, **Save**).
-* `ui/screens/SettingsDialog.kt` *(NEW)* — Modal dialog from TopAppBar gear icon: Gemini API key field (masked), model name dropdown/input (`gemini-2.5-flash` default), stale-price threshold slider (14–180 days), DB growth stats (`Seeded: 595 • Learned: N • Visual Index: M`).
-* `ui/screens/EditPinDialog.kt` *(NEW)* — Lightweight dialog to correct a pin's name, collection, low/high USD, rarity, or scrapper risk directly in SQLite.
-* `ui/screens/MyPinsScreen.kt` *(NEW)* — Clean segmented control (`Portfolio` | `Trades & ISO`) hosting existing `PortfolioScreen` and `TradesScreen`.
-* `ui/screens/ManualAppraisalScreen.kt` *(RENAMED from `ScannerScreen.kt`)* — Preserves existing scrapper/grading checklist as an optional route navigated to from `PinDetailScreen`.
-* `ui/screens/CatalogScreen.kt` — Add source filter chips (`All`, `Seeded`, `Gemini Learned`) and display local crop thumbnail on `PinCard` when `pin.referenceImagePath` exists.
-* `ui/screens/PinDetailScreen.kt` — Display cropped reference image, clickable web source citations (`Intent.ACTION_VIEW`), fixed Price History section, **"Refresh Price with Gemini"** button, and **"Edit Pin"** button.
-* `MainActivity.kt` — Update `BottomTab` to 3 tabs (`SCAN`, `CATALOG`, `MY_PINS`), set `startDestination = BottomTab.SCAN.route`, add routes `"scan_result"`, `"detail"`, `"manual_appraisal"`, and TopAppBar Settings icon.
-
----
-
-### Phase 5: Build Verification & Real-Photo Validation
-1. **Automated Checks:**
+#### Step 6.5 — Verification & Unit Tests
+1. Update `GeminiParserTest.kt` to test:
+   * Pass 1 parsing of `est_low_usd`, `est_high_usd`, `needs_web_verification`, and fallback defaults when omitted.
+   * Pass 2 selection cap (`top <= 4` prioritized by highest `est_high_usd`, remaining downgraded to `GEMINI_ESTIMATE`).
+2. Run:
    ```bash
    cd android
    ./gradlew testDebugUnitTest assembleDebug
    ```
-   All unit tests (existing `EvaluationEngineTest` + new `LocalPinMatcherTest`, `VisualFingerprintTest`, `GeminiParserTest`, `PinRepositorySanitizationTest`) and debug APK build MUST pass with zero errors.
-2. **Real-Photo Functional Verification Checklist:**
-   * **Test A (4-Pin Palm Photo — `PXL_20261123_030126127.MACRO_FOCUS.jpg`):** Upload photo → confirms `Hippo` (`PIN-0518`, `$57.50 Grail`) and `Mater` (`PIN-0484`, `$15.00`) resolve via `Local DB`; missing pins (e.g., Donald Cupcake, Moana/Maui Headband) resolve via `Gemini Web`, display source citations, and are inserted into `pins` (`GEM-XXXX`) + `pin_embeddings`.
-   * **Test B (Knowledge Extension Re-Scan):** Re-upload the exact same 4-pin photo → ALL 4 pins resolve via `Local DB` / `Local Visual` with **zero Pass 2 web calls**.
-   * **Test C (20-Pin Cast Member Board — `PXL_20261123_024921794.MP.jpg`):** Upload full board photo → renders readable, non-crashing color-coded price pills on the Mickey board and ranks top trade candidates at the top of the list.
-   * **Test D (Multi-Photo Batch):** Upload both photos simultaneously → horizontal pager switches between annotated photos; priority list merges & ranks pins from both photos.
-   * **Test E (Offline Mode):** Enable Airplane Mode → uploading a photo queues it cleanly to `pending_scans`; Catalog search and Recent Scans remain 100% functional; disabling Airplane Mode lets user tap **"Process Queued Scans"** to resolve them.
+3. Manual validation on a 20-pin board photo (`PXL_20261123_024921794.MP.jpg`):
+   * Confirm Google AI Studio dashboard shows **1–2 requests total** (never 10–27) and **0 retry storms**.
+   * Confirm all ~20 pins display price pills within ~5 seconds after Pass 1.
 
 ---
 
@@ -361,8 +384,10 @@ Execute phases **strictly in order**. Do not proceed to the next phase until the
 
 1. **DO NOT** insert or update `est_market_value_usd` or `price_tier` in `pins` — SQLite computes them automatically.
 2. **DO NOT** set `responseMimeType = "application/json"` on Pass 2 requests that include `"tools": [{"google_search": {}}]`. Parse JSON defensively from text instead.
-3. **DO NOT** overwrite `context.getDatabasePath("disney_pin_database.sqlite")` if it already exists — doing so destroys all Gemini-learned pins and user portfolio data.
-4. **DO NOT** decode full 12MP camera photos directly into Compose `ImageBitmap` without downsampling (`inSampleSize` / max 1600px) — causes `OutOfMemoryError` on multi-photo uploads.
-5. **ALWAYS** apply EXIF rotation (`ExifInterface`) BEFORE sending to Gemini and BEFORE cropping bounding boxes, otherwise bounding boxes will be rotated 90° relative to displayed photos.
-6. **ALWAYS** run database and network work on `Dispatchers.IO` inside `viewModelScope` and update Compose UI state via immutable `StateFlow` snapshots.
-7. **NEVER** commit a real Gemini API key to `build.gradle.kts`, `strings.xml`, or any tracked git file.
+3. **DO NOT** loop through all 20 pins in Pass 2 chunks — automatic Pass 2 MUST be capped at **1 single call for the top `<= 4` high-value/uncertain pins**.
+4. **DO NOT** retry `SocketTimeoutException` or HTTP `400`/`401`/`403`/`404`, and **DO NOT** retry `429`/`503` more than once or faster than `Retry-After` / `10s`.
+5. **DO NOT** overwrite `context.getDatabasePath("disney_pin_database.sqlite")` if it already exists — doing so destroys all Gemini-learned pins and user portfolio data.
+6. **DO NOT** decode full 12MP camera photos directly into Compose `ImageBitmap` without downsampling (`inSampleSize` / max 1600px) — causes `OutOfMemoryError` on multi-photo uploads.
+7. **ALWAYS** apply EXIF rotation (`ExifInterface`) BEFORE sending to Gemini and BEFORE cropping bounding boxes, otherwise bounding boxes will be rotated 90° relative to displayed photos.
+8. **ALWAYS** run database and network work on `Dispatchers.IO` inside `viewModelScope` and update Compose UI state via immutable `StateFlow` snapshots.
+9. **NEVER** commit a real Gemini API key to `build.gradle.kts`, `strings.xml`, or any tracked git file.
