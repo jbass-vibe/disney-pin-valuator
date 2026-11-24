@@ -10,7 +10,7 @@ class PinDatabaseHelper(private val context: Context) {
     companion object {
         private const val DB_NAME = "disney_pin_database.sqlite"
         private const val ASSET_NAME = "disney_pin_database.sqlite"
-        private const val CURRENT_SCHEMA_VERSION = 2
+        private const val CURRENT_SCHEMA_VERSION = 3
     }
 
     private var database: SQLiteDatabase? = null
@@ -34,14 +34,14 @@ class PinDatabaseHelper(private val context: Context) {
                 }
             }
         }
-        val db = SQLiteDatabase.openDatabase(
+        var db = SQLiteDatabase.openDatabase(
             dbFile.absolutePath,
             null,
             SQLiteDatabase.OPEN_READWRITE
         )
         db.execSQL("PRAGMA foreign_keys = ON;")
         ensureAppTables(db)
-        migrateIfNeeded(db)
+        db = migrateIfNeeded(db, dbFile)
         database = db
         return db
     }
@@ -84,11 +84,12 @@ class PinDatabaseHelper(private val context: Context) {
         )
     }
 
-    private fun migrateIfNeeded(db: SQLiteDatabase) {
+    private fun migrateIfNeeded(initialDb: SQLiteDatabase, dbFile: File): SQLiteDatabase {
+        var db = initialDb
         val currentVersion = db.rawQuery("PRAGMA user_version", null).use { c ->
             if (c.moveToFirst()) c.getInt(0) else 0
         }
-        if (currentVersion < CURRENT_SCHEMA_VERSION) {
+        if (currentVersion < 2) {
             addColumnIfMissing(db, "pins", "data_source", "TEXT NOT NULL DEFAULT 'Seeded'")
             addColumnIfMissing(db, "pins", "reference_image_path", "TEXT NOT NULL DEFAULT ''")
             addColumnIfMissing(db, "pins", "valuation_sources", "TEXT NOT NULL DEFAULT ''")
@@ -101,9 +102,84 @@ class PinDatabaseHelper(private val context: Context) {
             addColumnIfMissing(db, "scan_detections", "detected_label", "TEXT NOT NULL DEFAULT ''")
             addColumnIfMissing(db, "scan_detections", "market_low_usd", "REAL NOT NULL DEFAULT 0.0")
             addColumnIfMissing(db, "scan_detections", "market_high_usd", "REAL NOT NULL DEFAULT 0.0")
-
+        }
+        if (currentVersion < 3) {
+            db = migrateFts5ToFts4(db, dbFile)
+        }
+        if (currentVersion < CURRENT_SCHEMA_VERSION) {
             db.execSQL("PRAGMA user_version = $CURRENT_SCHEMA_VERSION")
         }
+        return db
+    }
+
+    private fun migrateFts5ToFts4(initialDb: SQLiteDatabase, dbFile: File): SQLiteDatabase {
+        var db = initialDb
+        db.execSQL("DROP TRIGGER IF EXISTS pins_ai")
+        db.execSQL("DROP TRIGGER IF EXISTS pins_ad")
+        db.execSQL("DROP TRIGGER IF EXISTS pins_au")
+
+        val droppedNormally = runCatching {
+            db.execSQL("DROP TABLE IF EXISTS pins_fts")
+            true
+        }.getOrDefault(false)
+
+        if (!droppedNormally) {
+            db.execSQL("PRAGMA writable_schema = ON")
+            db.execSQL("DELETE FROM sqlite_master WHERE name = 'pins_fts' OR name LIKE 'pins_fts_%'")
+            db.execSQL("PRAGMA writable_schema = OFF")
+            db.close()
+            db = SQLiteDatabase.openDatabase(
+                dbFile.absolutePath,
+                null,
+                SQLiteDatabase.OPEN_READWRITE
+            )
+            db.execSQL("PRAGMA foreign_keys = ON;")
+        }
+
+        db.execSQL(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS pins_fts USING fts4(
+                pin_id,
+                pin_name,
+                collection,
+                sub_set,
+                visual_tags,
+                pinpics_id,
+                notes
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO pins_fts(docid, pin_id, pin_name, collection, sub_set, visual_tags, pinpics_id, notes)
+            SELECT rowid, pin_id, pin_name, collection, sub_set, visual_tags, pinpics_id, notes FROM pins
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TRIGGER IF NOT EXISTS pins_ai AFTER INSERT ON pins BEGIN
+                INSERT INTO pins_fts(docid, pin_id, pin_name, collection, sub_set, visual_tags, pinpics_id, notes)
+                VALUES (new.rowid, new.pin_id, new.pin_name, new.collection, new.sub_set, new.visual_tags, new.pinpics_id, new.notes);
+            END
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TRIGGER IF NOT EXISTS pins_ad AFTER DELETE ON pins BEGIN
+                DELETE FROM pins_fts WHERE docid = old.rowid;
+            END
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TRIGGER IF NOT EXISTS pins_au AFTER UPDATE ON pins BEGIN
+                DELETE FROM pins_fts WHERE docid = old.rowid;
+                INSERT INTO pins_fts(docid, pin_id, pin_name, collection, sub_set, visual_tags, pinpics_id, notes)
+                VALUES (new.rowid, new.pin_id, new.pin_name, new.collection, new.sub_set, new.visual_tags, new.pinpics_id, new.notes);
+            END
+            """.trimIndent()
+        )
+        return db
     }
 
     private fun addColumnIfMissing(

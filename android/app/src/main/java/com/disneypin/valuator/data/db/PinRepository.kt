@@ -218,10 +218,10 @@ class PinRepository(private val dbHelper: PinDatabaseHelper) {
     ): List<Pin>? {
         return try {
             val tokens = query.split(Regex("\\s+"))
-                .map { it.replace("\"", "").replace("*", "").trim() }
+                .map { it.replace(Regex("[^a-zA-Z0-9]"), "").trim() }
                 .filter { it.isNotEmpty() }
             if (tokens.isEmpty()) return null
-            val ftsQuery = tokens.joinToString(" AND ") { "\"$it\"*" }
+            val ftsQuery = tokens.joinToString(" ") { "$it*" }
 
             val allWhere = mutableListOf("pins_fts MATCH ?")
             allWhere.addAll(extraWhere)
